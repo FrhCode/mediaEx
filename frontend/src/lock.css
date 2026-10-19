@@ -1,0 +1,21 @@
+/* Conceal content synchronously before React commits the lock screen. */
+html[data-app-locked] .private-content { visibility: hidden; }
+.lock-page { z-index: 40; }
+.lock-passkey { margin-top: 38px; }
+.lock-hint { font-size: 11px; color: var(--text-dim); line-height: 1.6; margin-top: 16px; }
+.lock-divider { display: flex; align-items: center; gap: 12px; color: var(--text-dim); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; margin-top: 28px; }
+.lock-divider::before, .lock-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.login-form.lock-form-secondary { margin-top: 20px; }
+.lock-page .lock-error { margin: 20px 0 0; }
+
+.lock-settings { border: 1px solid var(--border); background: var(--surface); border-radius: 12px; padding: 22px; }
+.lock-settings-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.lock-settings-head h2 { font-size: 16px; font-weight: 600; letter-spacing: -.2px; display: flex; align-items: center; gap: 9px; }
+.lock-settings-head h2 > svg { color: var(--accent); }
+.lock-settings > .muted { font-size: 13px; margin-top: 12px; }
+.lock-settings .lock-error { margin: 14px 0 0; }
+.lock-actions { display: flex; flex-direction: column; gap: 12px; margin-top: 18px; }
+.lock-actions .button { width: 100%; }
+.lock-form .field-label { margin-bottom: 8px; }
+.lock-note { font-size: 12px; color: var(--text-muted); line-height: 1.6; margin-top: 4px; }
+.lock-requirement { font-size: 12px; line-height: 1.6; color: var(--warn); background: var(--warn-soft); border-radius: 9px; padding: 12px 14px; }

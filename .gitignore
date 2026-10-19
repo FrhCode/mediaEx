@@ -1,0 +1,44 @@
+# Dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+coverage/
+/bin/
+/backend/bin/
+/backend/tmp/
+
+# Test artifacts
+playwright-report/
+test-results/
+*.test
+coverage.out
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+/compose.portainer.yaml
+*.local
+*.pem
+*.key
+
+# Runtime data
+/data/
+/backend/data/
+*.db
+*.db-shm
+*.db-wal
+/uploads/
+/backend/uploads/
+*.log
+
+# Editor and OS files
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Isolated working copies
+.claude/worktrees/

@@ -1,0 +1,81 @@
+# mediaEx — runs the published image, no local build required.
+#
+# Portainer
+#   Stacks → Add stack → name it (mediaex) → Web editor → paste this file.
+#   Then Environment variables → Advanced mode → paste the block below → Deploy the stack.
+#   Needs a Docker (standalone/Compose) endpoint, where Portainer feeds these values
+#   into a .env for substitution. On a Swarm endpoint stack.env cannot substitute into
+#   image/ports — hard-code those values there instead.
+#
+#   MEDIA_HOST_PATH=/volume1/media          # host folder holding the library (must already exist)
+#   ADMIN_NAME=admin                        # 3-64 chars, first run only
+#   ADMIN_PASSWORD=                         # 12-72 bytes, first run only; never resets existing users
+#   PORT=8080
+#   MEDIAEX_IMAGE=farhan100799/mediaex:1.0.12
+#
+#   Optional, same place:
+#   SCAN_INTERVAL=15m  SCAN_SETTLE=30s  MEDIA_MARKER=
+#   COOKIE_SECURE=false  PUBLIC_ORIGIN=
+#
+# Plain Docker
+#   Copy this file plus a .env next to it, then: docker compose -f compose.deploy.yaml up -d
+#
+# The image carries its own HEALTHCHECK (/healthz), so Portainer shows the container
+# as healthy once the app is serving.
+
+services:
+  mediaex:
+    # Pinned release by default; set MEDIAEX_IMAGE to run another version.
+    image: ${MEDIAEX_IMAGE:-farhan100799/mediaex:1.0.12}
+    ports:
+      - "${PORT:-8080}:8080"
+
+    environment:
+      # Required — the deploy fails with the message below when unset.
+      ADMIN_NAME: ${ADMIN_NAME:?set ADMIN_NAME in the stack environment variables}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD (12-72 bytes)}
+      # In-container paths, leave as they are.
+      MEDIA_ROOT: /media
+      DATA_DIR: /data
+      STATIC_DIR: /app/web
+      # Optional tuning.
+      SCAN_INTERVAL: ${SCAN_INTERVAL:-15m}
+      SCAN_SETTLE: ${SCAN_SETTLE:-30s}
+      TOOL_TIMEOUT: ${TOOL_TIMEOUT:-30s}
+      SPRITE_TIMEOUT: ${SPRITE_TIMEOUT:-2m}
+      CONVERT_TIMEOUT: ${CONVERT_TIMEOUT:-2h}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      MEDIA_MARKER: ${MEDIA_MARKER:-}
+      # Caddy HTTPS requires COOKIE_SECURE=true and exact HTTPS PUBLIC_ORIGIN together.
+      # TRUSTED_PROXIES should contain only the proxy's narrow CIDR for client rate limits.
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-}
+
+    volumes:
+      # The library, ro. The host path must exist (no auto-create), so a typo fails
+      # the deploy instead of mounting an empty folder.
+      - type: bind
+        source: ${MEDIA_HOST_PATH:?set MEDIA_HOST_PATH to the host media folder}
+        target: /media
+        read_only: true
+        bind:
+          create_host_path: false
+      - mediaex-data:/data
+
+    # The image runs as uid/gid 10001. If the media folder is not world-readable,
+    # uncomment the next line and use its numeric owner on the host (id -u, id -g) —
+    # and keep the mediaex-data volume writable by that user.
+    # user: "1000:1000"
+
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  mediaex-data:

@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+:root {
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  color-scheme: dark;
+
+  /* Surfaces. Deliberately neutral: the old ramp was navy at every level, so
+     swapping only the accent left the whole UI blue. */
+  --bg: #0f0f0f;
+  --surface: #1c1c1c;
+  --surface-raised: #212121;
+  --surface-hover: #2a2a2a;
+  --surface-strong: #333333;
+  --border: #303030;
+  --border-strong: #3f3f3f;
+
+  --text: #f1f1f1;
+  --text-muted: #a8a8a8;
+  /* Used for small labels (8-10px), so it is held at 4.5:1 rather than a
+     large-text threshold — dim small text was the old theme's readability bug. */
+  --text-dim: #8a8a8a;
+
+  /* One accent, used only where it carries meaning: active, focus, progress. */
+  --accent: #ff3b3b;
+  --accent-hover: #ff5a5a;
+  --accent-soft: #3a1616;
+
+  /* Danger stays red, so it is kept visually distinct from the accent by shape
+     rather than hue: every danger affordance is outlined, never a solid fill. */
+  --success: #6fd39a;
+  --success-soft: #16321f;
+  --danger: #ff8a80;
+  --danger-soft: #3a2020;
+  --warn: #e0a184;
+  --warn-soft: #33221c;
+  --info: #aaa4df;
+  --info-soft: #2b2b3d;
+
+  /* Replaces the scattered translucent whites and navies used for glass layers. */
+  --overlay: rgba(0, 0, 0, .72);
+  --overlay-soft: rgba(0, 0, 0, .45);
+  --shadow: rgba(0, 0, 0, .55);
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button, input, select { font: inherit; }
+button, a, input, select { -webkit-tap-highlight-color: transparent; }
+button, a { touch-action: manipulation; }
+button { cursor: pointer; }
+button:disabled { opacity: .55; cursor: wait; }
+a { color: inherit; text-decoration: none; }
+button { color: inherit; }
+button, input { border: 0; }
+button { background: none; }
+h1, h2, h3, p { margin: 0; }
+/* A light ring rather than the accent: red reads as an error state on focus. */
+:focus-visible { outline: 2px solid var(--text); outline-offset: 4px; }
+::selection { background: #4a4a4a; color: #fff; }
+input::placeholder { color: var(--text-dim); opacity: 1; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
