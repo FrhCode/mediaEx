@@ -332,6 +332,18 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 	st, err := f.Stat()
+	if err == nil && st.IsDir() {
+		// Opening "docs" or "docs/" succeeds as a directory on Linux; without this
+		// branch both would 404 instead of serving the directory's index.html.
+		f.Close()
+		f, err = root.Open(filepath.Join(p, "index.html"))
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		st, err = f.Stat()
+	}
 	if err != nil || !st.Mode().IsRegular() {
 		http.NotFound(w, r)
 		return

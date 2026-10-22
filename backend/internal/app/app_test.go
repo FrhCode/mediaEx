@@ -536,6 +536,40 @@ func TestPersistenceAndConfig(t *testing.T) {
 		t.Fatal("unsafe marker accepted")
 	}
 }
+func TestStaticDirectoryIndex(t *testing.T) {
+	c := Config{MediaRoot: t.TempDir(), DataDir: t.TempDir(), StaticDir: t.TempDir(), SessionTTL: time.Hour}
+	db, e := OpenDB(c.DataDir)
+	if e != nil {
+		t.Fatal(e)
+	}
+	t.Cleanup(func() { db.Close() })
+	s := NewServer(c, db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	if e := os.MkdirAll(filepath.Join(c.StaticDir, "docs"), 0700); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(filepath.Join(c.StaticDir, "docs", "index.html"), []byte("docs-ui"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(filepath.Join(c.StaticDir, "index.html"), []byte("spa"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	for _, p := range []string{"/docs", "/docs/"} {
+		res, e := ts.Client().Get(ts.URL + p)
+		if e != nil {
+			t.Fatal(e)
+		}
+		b, e := io.ReadAll(res.Body)
+		res.Body.Close()
+		if e != nil {
+			t.Fatal(e)
+		}
+		if res.StatusCode != 200 || string(b) != "docs-ui" {
+			t.Fatalf("%s status=%d body=%q", p, res.StatusCode, b)
+		}
+	}
+}
 func TestLoginThrottle(t *testing.T) {
 	_, ts, c := setup(t)
 	for i := 0; i < 10; i++ {
