@@ -53,9 +53,11 @@ info:
     (dihasilkan library go-webauthn). Passkey hanya tersedia bila
     `PUBLIC_ORIGIN` adalah origin HTTPS (atau localhost untuk development);
     kalau tidak, endpoint terkait menjawab **409** `LOCK_UNAVAILABLE`.
-servers:
-  - url: http://localhost:8080
-    description: Default (LISTEN_ADDR :8080)
+
+    ## Server
+
+    Spesifikasi ini sengaja tidak mendeklarasikan `servers`: Swagger UI akan
+    memakai origin tempat halaman viewer dibuka.
 tags:
   - name: Health
     description: Probe publik untuk container orchestration.
