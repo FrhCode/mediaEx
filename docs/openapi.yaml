@@ -1,0 +1,1647 @@
+openapi: 3.1.0
+info:
+  title: mediaEx API
+  version: 1.0.0
+  summary: Media library server with session lock, playback conversion, and admin tooling.
+  description: |
+    API untuk server mediaEx: pustaka media (video/gambar) dari `MEDIA_ROOT`,
+    konversi playback otomatis via FFmpeg, dan manajemen user/issue untuk admin.
+
+    ## Autentikasi
+
+    Semua endpoint kecuali `/healthz` dan `/api/login` membutuhkan cookie sesi
+    `mediaex_session` (HttpOnly, SameSite=Lax, di-set saat login). Server
+    menyimpan hash SHA-256 dari token; masa hidup mengikuti `SESSION_TTL`.
+
+    ## Session lock
+
+    Jika lock aktif untuk sesi (fitur passkey/password), endpoint yang
+    membutuhkan konteks "unlocked" menjawab **423** dengan
+    `{"code": "APP_LOCKED"}` sampai client membuka kunci lewat salah satu
+    endpoint `/api/lock/*` (password atau WebAuthn). Grant berupa cookie
+    `mediaex_unlock` (HttpOnly, scope `/api`) dengan masa hidup 60 detik yang
+    bisa diperpanjang lewat `POST /api/lock/renew`. Endpoint lock sendiri
+    hanya butuh identitas sesi (bisa diakses saat locked).
+
+    ## Aturan request
+
+    - Request non-GET dengan body harus `Content-Type: application/json`,
+      kalau tidak: **415**.
+    - Request non-GET harus dari origin yang sama (`Origin` header cocok dengan
+      `PUBLIC_ORIGIN`, atau Host saat `PUBLIC_ORIGIN` kosong); kalau tidak: **403**.
+    - JSON decoder menolak field yang tidak dikenal (`DisallowUnknownFields`)
+      dan body lebih dari satu dokumen: **400**.
+    - Login dan verifikasi password/lock di-throttle per IP + akun: **429**
+      dengan `Retry-After: 900`.
+
+    ## Error
+
+    Respons error umumnya `{"message": string}`. Error lock menyertakan
+    `code` machine-readable. Kode yang dipakai:
+    `APP_LOCKED`, `LOCK_NOT_ENABLED`, `LOCK_UNAVAILABLE`, `NO_PASSKEY`,
+    `INVALID_PASSWORD`, `CEREMONY_INVALID`, `CREDENTIAL_IN_USE`,
+    `LOCK_CHANGED`, `UNLOCK_FAILED`.
+
+    ## Waktu
+
+    Semua timestamp adalah detik Unix (integer), kecuali `duration`,
+    `progress`, `interval`, dan `seconds` yang berupa detik (float).
+
+    ## WebAuthn
+
+    Payload `publicKey` di options/finish mengikuti standar WebAuthn Level 2
+    (dihasilkan library go-webauthn). Passkey hanya tersedia bila
+    `PUBLIC_ORIGIN` adalah origin HTTPS (atau localhost untuk development);
+    kalau tidak, endpoint terkait menjawab **409** `LOCK_UNAVAILABLE`.
+servers:
+  - url: http://localhost:8080
+    description: Default (LISTEN_ADDR :8080)
+tags:
+  - name: Health
+    description: Probe publik untuk container orchestration.
+  - name: Auth
+    description: 'Sesi login: cookie, akun, dan tampilan session.'
+  - name: Lock
+    description: 'Session lock: passkey WebAuthn + password, dan unlock grant.'
+  - name: Library
+    description: 'Navigasi folder, daftar media, dan progress tontonan.'
+  - name: Items
+    description: 'Konten biner media: konten asli, playback, thumbnail, sprite.'
+  - name: Admin
+    description: 'Manajemen user dan issue pipeline (khusus role admin).'
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      description: Selalu 200 selama proses hidup. Tidak mengecek dependensi.
+      operationId: healthz
+      responses:
+        '200':
+          description: Server hidup.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [ok]}
+              example: {status: ok}
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      description: 200 hanya jika media root bisa dibuka dan database merespons.
+      operationId: readyz
+      responses:
+        '200':
+          description: Siap melayani.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [ok]}
+        '503':
+          description: Media library belum siap.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/session:
+    get:
+      tags: [Auth]
+      summary: Session saat ini
+      description: Mengembalikan session aktif, atau `null` bila tidak ada cookie sesi valid.
+      operationId: getSession
+      security:
+        - {} # boleh tanpa cookie: hasilnya null
+        - sessionCookie: []
+      responses:
+        '200':
+          description: Session aktif, atau null.
+          content:
+            application/json:
+              schema:
+                type: [object, 'null']
+                allOf:
+                  - $ref: '#/components/schemas/Session'
+        '500':
+          description: Kesalahan server.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/login:
+    post:
+      tags: [Auth]
+      summary: Login
+      description: |
+        Verifikasi username + password (bcrypt), membuat sesi baru, dan meng-set
+        cookie `mediaex_session`. Login baru selalu menghapus grant unlock lama.
+        Di-throttle per IP (10 percobaan / 15 menit).
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              additionalProperties: false
+              properties:
+                username: {type: string}
+                password: {type: string}
+      responses:
+        '200':
+          description: Login berhasil; cookie sesi di-set.
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+              description: mediaex_session=<token>; HttpOnly; SameSite=Lax
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Session'}
+        '400':
+          description: Body tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Username atau password salah, atau akun nonaktif.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Origin tidak diizinkan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '415':
+          description: Content-Type bukan application/json.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Terlalu banyak percobaan.
+          headers:
+            Retry-After:
+              schema: {type: integer}
+              description: Selalu 900 (detik).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/logout:
+    post:
+      tags: [Auth]
+      summary: Logout
+      description: Menghapus sesi dari database (FK cascade ke lock/grant/challenge) dan menghapus kedua cookie.
+      operationId: logout
+      security: []
+      responses:
+        '200':
+          description: Selalu 200; cookie dihapus.
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+              description: Kedua cookie (session dan unlock) di-expire.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean, enum: [true]}
+  /api/lock/status:
+    get:
+      tags: [Lock]
+      summary: Status lock sesi
+      description: |
+        Read-only; tidak memperpanjang grant. `expiresAt` hanya bermakna saat
+        `grantActive` true. Hanya butuh identitas sesi (bisa saat locked).
+      operationId: lockStatus
+      responses:
+        '200':
+          description: Status lock, passkey, dan grant.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lockEnabled, hasPasskey, passkeyAvailable, grantActive, expiresAt]
+                additionalProperties: false
+                properties:
+                  lockEnabled: {type: boolean}
+                  hasPasskey: {type: boolean}
+                  passkeyAvailable: {type: boolean}
+                  grantActive: {type: boolean}
+                  expiresAt: {type: integer, format: int64, description: Detik Unix; 0 bila tidak ada grant.}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/lock/register/options:
+    post:
+      tags: [Lock]
+      summary: Mulai registrasi passkey
+      description: |
+        Memverifikasi password, lalu membuat WebAuthn ceremony registrasi.
+        Selesai di `register/finish` (yang juga meng-enable lock dan memberi grant).
+      operationId: lockRegisterOptions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              additionalProperties: false
+              properties:
+                password: {type: string}
+      responses:
+        '200':
+          description: Opsi registrasi WebAuthn + ID ceremony.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CeremonyOptions'}
+        '400':
+          description: Body tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Password salah (`INVALID_PASSWORD`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '409':
+          description: Passkey tidak tersedia di deployment (`LOCK_UNAVAILABLE`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '429':
+          description: Throttle password.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/lock/register/finish:
+    post:
+      tags: [Lock]
+      summary: Selesaikan registrasi passkey
+      description: |
+        Memvalidasi attestation, menyimpan credential, meng-enable lock untuk
+        sesi, dan mengeluarkan grant (cookie `mediaex_unlock`).
+      operationId: lockRegisterFinish
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CeremonyFinish'
+      responses:
+        '200':
+          description: Passkey terdaftar, lock aktif, grant di-set.
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+              description: mediaex_unlock=<grant>; Path=/api; HttpOnly; SameSite=Lax; Max-Age=60
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [expiresAt, session]
+                additionalProperties: false
+                properties:
+                  expiresAt: {type: integer, format: int64}
+                  session: {$ref: '#/components/schemas/Session'}
+        '400':
+          description: Ceremony tidak valid / sudah dipakai (`CEREMONY_INVALID`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '401':
+          description: Sesi berakhir saat ceremony.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: '`CREDENTIAL_IN_USE` atau `LOCK_CHANGED`.'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/lock/unlock/options:
+    post:
+      tags: [Lock]
+      summary: Mulai unlock dengan passkey
+      description: Membuat WebAuthn assertion ceremony untuk sesi yang sedang locked.
+      operationId: lockUnlockOptions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false}
+      responses:
+        '200':
+          description: Opsi assertion WebAuthn + ID ceremony.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CeremonyOptions'}
+        '400':
+          description: Body tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: '`LOCK_NOT_ENABLED` (sesi tidak locked), `NO_PASSKEY` (belum ada passkey), atau `LOCK_UNAVAILABLE`.'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/lock/unlock/finish:
+    post:
+      tags: [Lock]
+      summary: Selesaikan unlock dengan passkey
+      description: Memvalidasi assertion dan mengeluarkan grant baru.
+      operationId: lockUnlockFinish
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CeremonyFinish'
+      responses:
+        '200':
+          description: Unlock berhasil; grant di-set.
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GrantResult'}
+        '400':
+          description: Ceremony tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '401':
+          description: Sesi berakhir saat ceremony.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Verifikasi assertion gagal (`UNLOCK_FAILED`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '409':
+          description: Passkey tidak tersedia (`LOCK_UNAVAILABLE`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '423':
+          description: Policy berubah saat ceremony (`APP_LOCKED`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/lock/enable/options:
+    post:
+      tags: [Lock]
+      summary: Mulai enable lock dengan passkey yang sudah ada
+      description: Assertion ceremony untuk mengaktifkan lock pada sesi baru.
+      operationId: lockEnableOptions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false}
+      responses:
+        '200':
+          description: Opsi assertion WebAuthn + ID ceremony.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CeremonyOptions'}
+        '400':
+          description: Body tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: '`NO_PASSKEY` atau `LOCK_UNAVAILABLE`.'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/lock/enable/finish:
+    post:
+      tags: [Lock]
+      summary: Selesaikan enable lock dengan passkey
+      description: Memvalidasi assertion, meng-enable lock, dan mengeluarkan grant.
+      operationId: lockEnableFinish
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CeremonyFinish'
+      responses:
+        '200':
+          description: Lock aktif; grant di-set.
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [expiresAt, session]
+                additionalProperties: false
+                properties:
+                  expiresAt: {type: integer, format: int64}
+                  session: {$ref: '#/components/schemas/Session'}
+        '400':
+          description: Ceremony tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '401':
+          description: Sesi berakhir saat ceremony.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Verifikasi gagal (`UNLOCK_FAILED`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '409':
+          description: '`LOCK_CHANGED` atau `LOCK_UNAVAILABLE`.'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/lock/password:
+    post:
+      tags: [Lock]
+      summary: Unlock dengan password
+      description: |
+        Alternatif non-passkey untuk membuka lock. Di-throttle per akun + IP.
+        Snapshot epoch sebelum bcrypt menolak race dengan disable/lock.
+      operationId: lockUnlockPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              additionalProperties: false
+              properties:
+                password: {type: string}
+      responses:
+        '200':
+          description: Unlock berhasil; grant di-set.
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GrantResult'}
+        '400':
+          description: Body tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Sesi berakhir.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Password salah (`INVALID_PASSWORD`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '409':
+          description: Sesi tidak locked (`LOCK_NOT_ENABLED`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '423':
+          description: Policy berubah saat verifikasi (`APP_LOCKED`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '429':
+          description: Throttle password.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/lock/renew:
+    post:
+      tags: [Lock]
+      summary: Perpanjang grant aktif
+      description: |
+        Memperpanjang **hanya** grant yang masih hidup yang dibawa cookie.
+        Grant yang sudah expired tidak bisa dihidupkan lagi (harus unlock ulang).
+        Tidak membaca/menulis body.
+      operationId: lockRenew
+      responses:
+        '200':
+          description: Grant diperpanjang 60 detik; cookie di-set ulang.
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GrantResult'}
+        '401':
+          description: Sesi berakhir.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: Sesi tidak locked (`LOCK_NOT_ENABLED`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '423':
+          description: Tidak ada grant hidup (`APP_LOCKED`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/lock/lock:
+    post:
+      tags: [Lock]
+      summary: Kunci sesi sekarang
+      description: |
+        Mencabut semua grant, mem-bump epoch (ceremony in-flight gagal), dan
+        menghapus cookie unlock. Bisa membawa progress tontonan terakhir;
+        progress hanya ditulis atomically selama grant masih hidup di transaksi.
+      operationId: lockNow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                progress:
+                  type: object
+                  required: [itemId, seconds]
+                  additionalProperties: false
+                  properties:
+                    itemId: {type: string, pattern: '^[0-9a-f]{64}$'}
+                    seconds: {type: number, description: Detik; NaN/Inf ditolak.}
+      responses:
+        '200':
+          description: Sesi dikunci; cookie unlock dihapus.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [locked]
+                additionalProperties: false
+                properties:
+                  locked: {type: boolean, enum: [true]}
+        '400':
+          description: Body tidak valid, atau progress untuk bukan video / nilai tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Sesi berakhir.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Item progress tidak ditemukan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Grant sudah mati saat progress ditulis (`APP_LOCKED`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/lock/disable:
+    post:
+      tags: [Lock]
+      summary: Matikan lock untuk sesi
+      description: |
+        Butuh password. Menghapus policy, grant, dan challenge; credential
+        passkey tetap tersimpan. Bump epoch menginvalidate ceremony in-flight.
+      operationId: lockDisable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              additionalProperties: false
+              properties:
+                password: {type: string}
+      responses:
+        '200':
+          description: Lock dimatikan; session view diperbarui (lockEnabled=false).
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+              description: Cookie unlock dihapus.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session]
+                additionalProperties: false
+                properties:
+                  session: {$ref: '#/components/schemas/Session'}
+        '400':
+          description: Body tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Sesi berakhir.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Password salah (`INVALID_PASSWORD`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '429':
+          description: Throttle password.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/library:
+    get:
+      tags: [Library]
+      summary: Daftar library
+      description: |
+        Mengembalikan struktur folder (navigasi root, subfolder, breadcrumb),
+        item media untuk scope, dan "continue watching". `scope` default `all`,
+        atau `folder` bila `folder` diberikan. `q` memfilter nama (case-insensitive)
+        di dalam folder terpilih (atau seluruh library bila tanpa folder).
+        Item yang di-skip dengan dimensi tidak valid disembunyikan.
+      operationId: getLibrary
+      parameters:
+        - name: folder
+          in: query
+          schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+          description: ID folder untuk scope=folder.
+        - name: scope
+          in: query
+          schema: {type: string, enum: [all, folder], default: all}
+        - name: q
+          in: query
+          schema: {type: string}
+          description: Filter nama media (case-insensitive).
+      responses:
+        '200':
+          description: Struktur library.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LibraryView'}
+        '400':
+          description: Kombinasi scope/folder tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Folder tidak ditemukan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/items/{id}:
+    get:
+      tags: [Library]
+      summary: Detail satu media
+      operationId: getItem
+      parameters:
+        - $ref: '#/components/parameters/ItemID'
+      responses:
+        '200':
+          description: Detail media + progress user + status playback (video).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Media'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Media tidak ditemukan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/items/{id}/progress:
+    put:
+      tags: [Library]
+      summary: Simpan posisi tontonan
+      description: Hanya untuk video. Nilai di-clamp ke [0, duration]. Progress yang
+        menyentuh akhir video dianggap selesai (direset ke 0 saat dibaca).
+      operationId: putProgress
+      parameters:
+        - $ref: '#/components/parameters/ItemID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [progress]
+              additionalProperties: false
+              properties:
+                progress: {type: number, description: Posisi dalam detik; wajib finite.}
+      responses:
+        '200':
+          description: Tersimpan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Ok'}
+        '400':
+          description: Body tidak valid atau bukan video.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Media tidak ditemukan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/items/{id}/content:
+    get:
+      tags: [Items]
+      summary: Stream konten asli
+      description: 'File media asli dari MEDIA_ROOT dengan MIME terverifikasi scan. Mendukung HTTP Range. Cache-Control: private, no-store.'
+      operationId: getContent
+      parameters:
+        - $ref: '#/components/parameters/ItemID'
+      responses:
+        '200':
+          description: Konten media (streaming).
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '206':
+          description: Partial content (range request).
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Media tidak ditemukan atau file hilang.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+        '503':
+          description: Media storage tidak tersedia.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/items/{id}/playback:
+    get:
+      tags: [Items]
+      summary: Stream hasil konversi playback
+      description: |
+        MP4 hasil derivasi (remux/transcode) untuk video yang tidak bisa diputar
+        langsung browser. `v` harus cocok dengan `sourceKey` pada status playback
+        (versi cache); salah versi = 404. Hanya ada saat status `ready`.
+      operationId: getPlayback
+      parameters:
+        - $ref: '#/components/parameters/ItemID'
+        - name: v
+          in: query
+          schema: {type: string}
+          description: Versi derivasi (source key) dari field `playback.src`.
+      responses:
+        '200':
+          description: Video MP4 (streaming, range support).
+          headers:
+            Content-Type:
+              schema: {type: string, enum: [video/mp4]}
+          content:
+            video/mp4:
+              schema: {type: string, format: binary}
+        '206':
+          description: Partial content.
+          content:
+            video/mp4:
+              schema: {type: string, format: binary}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Playback belum ready / versi tidak cocok / file hilang.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/items/{id}/thumbnail:
+    get:
+      tags: [Items]
+      summary: Thumbnail media
+      description: JPEG hasil scan; bila belum ada, placeholder SVG generik (200).
+      operationId: getThumbnail
+      parameters:
+        - $ref: '#/components/parameters/ItemID'
+      responses:
+        '200':
+          description: Thumbnail JPEG atau placeholder SVG.
+          content:
+            image/jpeg:
+              schema: {type: string, format: binary}
+            image/svg+xml:
+              schema: {type: string}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Media tidak ditemukan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/items/{id}/sprite:
+    get:
+      tags: [Items]
+      summary: Sprite sheet preview video
+      description: |
+        Satu JPEG berisi grid `cols` x `rows` tile frame yang di-sample tiap
+        `interval` detik (lihat `Media.sprite`). `v` adalah cache key dari
+        `Media.sprite.url`; salah versi = 404. Tidak ada placeholder — 404
+        asli supaya tile maths client tidak rusak.
+      operationId: getSprite
+      parameters:
+        - $ref: '#/components/parameters/ItemID'
+        - name: v
+          in: query
+          schema: {type: string}
+          description: Cache key sprite dari `Media.sprite.url`.
+      responses:
+        '200':
+          description: Sprite sheet JPEG.
+          headers:
+            ETag:
+              schema: {type: string}
+          content:
+            image/jpeg:
+              schema: {type: string, format: binary}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Media tidak ditemukan, bukan video, atau sprite belum ada.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/admin/users:
+    get:
+      tags: [Admin]
+      summary: Daftar semua user
+      description: Diurutkan username case-insensitive. Bisa kosong (`[]`).
+      operationId: listUsers
+      responses:
+        '200':
+          description: Daftar user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [users]
+                additionalProperties: false
+                properties:
+                  users:
+                    type: array
+                    items: {$ref: '#/components/schemas/User'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Bukan admin.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+    post:
+      tags: [Admin]
+      summary: Buat user baru
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UserInput'}
+      responses:
+        '201':
+          description: User dibuat.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '400':
+          description: Validasi gagal (username/password/name/role).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Bukan admin.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: Username sudah dipakai.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/admin/users/{id}:
+    patch:
+      tags: [Admin]
+      summary: Update user
+      description: |
+        Semua field opsional. Mengganti password, role, atau menonaktifkan
+        akun mencabut semua sesi user tersebut. Admin terakhir yang aktif
+        tidak bisa diturunkan/dinonaktifkan/dihapus (409).
+      operationId: updateUser
+      parameters:
+        - $ref: '#/components/parameters/UserID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UserInput'}
+      responses:
+        '200':
+          description: User ter-update.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '400':
+          description: Validasi gagal.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Bukan admin.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: User tidak ditemukan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: Username duplikat atau guard admin terakhir.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+    delete:
+      tags: [Admin]
+      summary: Hapus user
+      description: Menghapus user dan semua sesinya. Admin terakhir yang aktif tidak bisa dihapus (409).
+      operationId: deleteUser
+      parameters:
+        - $ref: '#/components/parameters/UserID'
+      responses:
+        '200':
+          description: Terhapus.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Ok'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Bukan admin.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: User tidak ditemukan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: Guard admin terakhir.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/admin/issues:
+    get:
+      tags: [Admin]
+      summary: Daftar issue pipeline media
+      description: |
+        Tab `failed` (probe/sprite/conversion gagal), `queue` (derivasi
+        pending/processing/waiting_source), atau `skipped`. Selalu menyertakan
+        counts global untuk keenam kategori. Pagination via limit/offset.
+      operationId: listIssues
+      parameters:
+        - name: tab
+          in: query
+          schema: {type: string, enum: [failed, queue, skipped], default: failed}
+        - name: q
+          in: query
+          schema: {type: string, maxLength: 200}
+          description: Filter nama/path (case-insensitive).
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - name: offset
+          in: query
+          schema: {type: integer, minimum: 0, default: 0}
+      responses:
+        '200':
+          description: Halaman issue + counts.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/IssuePage'}
+        '400':
+          description: Parameter tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Bukan admin.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/admin/issues/skip:
+    post:
+      tags: [Admin]
+      summary: Skip banyak item sekaligus
+      description: Item yang tidak ada dihitung sukses di-skip (di-skip count hanya yang ada).
+      operationId: skipIssues
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              additionalProperties: false
+              properties:
+                ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 200
+                  items: {type: string, pattern: '^[0-9a-f]{64}$'}
+                reason: {type: string, maxLength: 500}
+      responses:
+        '200':
+          description: Jumlah item yang berhasil di-skip.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, skipped]
+                additionalProperties: false
+                properties:
+                  ok: {type: boolean, enum: [true]}
+                  skipped: {type: integer}
+        '400':
+          description: IDs kosong/kebanyakan atau note terlalu panjang.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Bukan admin.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/admin/issues/{id}/skip:
+    post:
+      tags: [Admin]
+      summary: Skip satu item
+      operationId: skipIssue
+      parameters:
+        - $ref: '#/components/parameters/ItemID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              additionalProperties: false
+              properties:
+                reason: {type: string, maxLength: 500}
+      responses:
+        '200':
+          description: Di-skip.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Ok'}
+        '400':
+          description: Note terlalu panjang / body tidak valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Bukan admin.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Media tidak ditemukan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+    delete:
+      tags: [Admin]
+      summary: Kembalikan (unskip) satu item
+      description: Menghapus skip mark dan menjadwalkan probe ulang pada scan berikutnya.
+      operationId: unskipIssue
+      parameters:
+        - $ref: '#/components/parameters/ItemID'
+      responses:
+        '200':
+          description: Di-restore.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Ok'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Bukan admin.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Media tidak ditemukan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+  /api/admin/issues/{id}/retry:
+    post:
+      tags: [Admin]
+      summary: Retry konversi gagal untuk satu item
+      description: |
+        Mengubah derivasi `failed` menjadi `pending` (attempt reset) dan
+        menjadwalkan probe ulang. Item yang masih di-skip harus di-restore dulu.
+      operationId: retryIssue
+      parameters:
+        - $ref: '#/components/parameters/ItemID'
+      responses:
+        '200':
+          description: Dijadwalkan ulang.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Ok'}
+        '401':
+          description: Tidak ada sesi valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Bukan admin.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Media tidak ditemukan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: Item masih di-skip.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: Session locked.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodedError'}
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: mediaex_session
+      description: Cookie sesi HttpOnly yang di-set oleh POST /api/login.
+  parameters:
+    ItemID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+      description: ID media (64 hex chars).
+    UserID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+      description: ID user (64 hex chars).
+  schemas:
+    Error:
+      type: object
+      description: Error generik; hanya pesan user-facing, tanpa kode machine-readable.
+      required: [message]
+      properties:
+        message: {type: string}
+      additionalProperties: false
+    CodedError:
+      type: object
+      description: Error dengan `code` machine-readable; dipakai di flow session lock.
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [APP_LOCKED, LOCK_NOT_ENABLED, LOCK_UNAVAILABLE, NO_PASSKEY, INVALID_PASSWORD, CEREMONY_INVALID, CREDENTIAL_IN_USE, LOCK_CHANGED, UNLOCK_FAILED]
+        message: {type: string}
+      additionalProperties: false
+    Ok:
+      type: object
+      description: Konfirmasi sukses generik.
+      required: [ok]
+      properties:
+        ok: {type: boolean, enum: [true]}
+      additionalProperties: false
+    Session:
+      type: object
+      description: Tampilan akun untuk session aktif.
+      example:
+        id: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        username: admin
+        name: Admin
+        role: admin
+        lockEnabled: false
+        hasPasskey: true
+        passkeyAvailable: true
+      required: [id, username, name, role, lockEnabled, hasPasskey, passkeyAvailable]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: '^[0-9a-f]{64}$'}
+        username: {type: string}
+        name: {type: string}
+        role: {type: string, enum: [admin, user]}
+        lockEnabled: {type: boolean, description: Policy lock untuk sesi ini (bukan status grant).}
+        hasPasskey: {type: boolean}
+        passkeyAvailable: {type: boolean, description: Deployment mengizinkan WebAuthn (PUBLIC_ORIGIN valid).}
+    User:
+      type: object
+      description: Akun user (tampilan admin).
+      example:
+        id: fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+        username: riana
+        name: Riana
+        role: user
+        active: true
+        createdAt: 1760000000
+      required: [id, username, name, role, active, createdAt]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: '^[0-9a-f]{64}$'}
+        username: {type: string}
+        name: {type: string}
+        role: {type: string, enum: [admin, user]}
+        active: {type: boolean}
+        createdAt: {type: integer, format: int64, description: Detik Unix.}
+    UserInput:
+      type: object
+      additionalProperties: false
+      description: Untuk create, `username` dan `password` wajib; sisanya opsional. Untuk patch semua opsional.
+      properties:
+        username:
+          type: string
+          pattern: '^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,63}$'
+          description: 3–64 karakter; huruf/angka di awal; lalu huruf, angka, dot, dash, underscore.
+        name: {type: string, minLength: 1, maxLength: 100}
+        password: {type: string, minLength: 12, maxLength: 72, description: 12–72 bytes.}
+        role: {type: string, enum: [admin, user]}
+        active: {type: boolean}
+    Folder:
+      type: object
+      description: Folder di MEDIA_ROOT beserta jumlah media rekursif.
+      example: {id: aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899, name: Movies, count: 12, parentId: ''}
+      required: [id, name, count, parentId]
+      additionalProperties: false
+      properties:
+        id: {type: string}
+        name: {type: string}
+        count: {type: integer, description: Jumlah media di bawah folder (rekursif).}
+        parentId: {type: string, description: Kosong untuk root.}
+    Sprite:
+      type: object
+      required: [url, cols, rows, count, interval]
+      additionalProperties: false
+      description: |
+        Geometri sprite sheet: grid `cols` x `rows`, tile di-sample tiap
+        `interval` detik; `count` = jumlah tile yang benar-benar memuat frame.
+        Hanya untuk video dengan durasi valid.
+      properties:
+        url: {type: string, description: '/api/items/{id}/sprite?v={cacheKey}'}
+        cols: {type: integer}
+        rows: {type: integer}
+        count: {type: integer}
+        interval: {type: number, description: Detik antar tile.}
+    Playback:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [direct, processing, ready, failed, unsupported]
+          description: |
+            `direct` = file asli bisa diputar browser (src asli);
+            `ready` = pakai `src` hasil konversi; `processing` = derivasi
+            berjalan; `failed`/`unsupported` = lihat `reason`.
+        src: {type: string, description: '/api/items/{id}/playback?v={sourceKey}; hanya saat status=ready.'}
+        reason: {type: string, description: Pesan user-facing saat failed/unsupported.}
+    Media:
+      type: object
+      description: Satu item media dalam tampilan library.
+      example:
+        id: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        folderId: aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899
+        name: holiday-2024.mp4
+        kind: video
+        image: /api/items/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/thumbnail
+        src: /api/items/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/content
+        resolution: 1920 × 1080
+        size: 1.4 GB
+        format: MKV
+        duration: 7543.2
+        progress: 312.5
+        sprite:
+          url: /api/items/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/sprite?v=9f8e7d
+          cols: 10
+          rows: 13
+          count: 126
+          interval: 59.9
+        playback:
+          status: ready
+          src: /api/items/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/playback?v=9f8e7d
+      required: [id, folderId, name, kind, image, src, resolution, size, format, duration, progress]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: '^[0-9a-f]{64}$'}
+        folderId: {type: string}
+        name: {type: string}
+        kind: {type: string, enum: [video, image]}
+        image: {type: string, description: '/api/items/{id}/thumbnail'}
+        src: {type: string, description: '/api/items/{id}/content'}
+        resolution: {type: string, description: '"Unknown" bila dimensi tidak terbaca; format "1920 × 1080".'}
+        size: {type: string, description: Human-readable, mis. "1.4 GB".}
+        format: {type: string, description: Container/format dari scan, mis. "MP4".}
+        duration: {type: number, description: Detik; 0 untuk gambar/tanpa durasi.}
+        progress: {type: number, description: Posisi tontonan user ini (detik); 0 bila selesai/dimulai.}
+        sprite: {$ref: '#/components/schemas/Sprite'}
+        playback: {$ref: '#/components/schemas/Playback'}
+    LibraryView:
+      type: object
+      description: Respons GET /api/library; struktur navigasi + item + continue watching.
+      required: [folders, items, continuing, folder, navigation, breadcrumbs]
+      additionalProperties: false
+      properties:
+        folders:
+          type: array
+          items: {$ref: '#/components/schemas/Folder'}
+          description: Subfolder langsung dari folder terpilih (kosong saat pencarian).
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Media'}
+          description: Media dalam scope (atau hasil pencarian).
+        continuing:
+          type: array
+          items: {$ref: '#/components/schemas/Media'}
+          description: Video dengan progress > 0 yang belum selesai.
+        folder:
+          type: ['null', object]
+          allOf:
+            - $ref: '#/components/schemas/Folder'
+          description: Folder terpilih; null untuk root/all.
+        navigation:
+          type: array
+          items: {$ref: '#/components/schemas/Folder'}
+          description: Folder root untuk navigasi utama.
+        breadcrumbs:
+          type: array
+          items: {$ref: '#/components/schemas/Folder'}
+          description: Jalur root → folder terpilih (kosong untuk root).
+    CeremonyOptions:
+      type: object
+      description: Respons options ceremony WebAuthn; `publicKey` diteruskan ke navigator.credentials.
+      required: [ceremonyId, publicKey]
+      additionalProperties: false
+      properties:
+        ceremonyId: {type: string, description: ID challenge; dipakai di finish, single-use, TTL 2 menit.}
+        publicKey:
+          type: object
+          description: PublicKeyCredentialCreationOptions atau PublicKeyCredentialRequestOptions (WebAuthn Level 2).
+          additionalProperties: true
+    CeremonyFinish:
+      type: object
+      description: Body finish ceremony; `credential` adalah PublicKeyCredential yang di-serialisasi JSON.
+      required: [ceremonyId, credential]
+      additionalProperties: false
+      properties:
+        ceremonyId: {type: string}
+        credential:
+          type: object
+          description: PublicKeyCredential hasil navigator.credentials.create()/get() di-serialisasi JSON.
+          additionalProperties: true
+    GrantResult:
+      type: object
+      description: Respons sukses unlock/renew; grant sendiri hanya keluar sebagai cookie.
+      required: [expiresAt]
+      additionalProperties: false
+      properties:
+        expiresAt: {type: integer, format: int64, description: Detik Unix kedaluwarsa grant (60 detik dari sekarang).}
+    IssueItem:
+      type: object
+      description: Satu baris pada tab issue admin.
+      example:
+        id: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        name: broken-file.mkv
+        path: Movies/broken-file.mkv
+        kind: video
+        format: MKV
+        size: 4294967296
+        modifiedAt: 1759000000
+        width: 1280
+        height: 720
+        duration: 3600
+        stage: conversion
+        attempt: 3
+        maxAttempts: 3
+        nextRetryAt: null
+        reason: 'ffmpeg exited with code 1'
+        strategy: transcode_full
+        status: failed
+        updatedAt: 1759900000
+      required: [id, name, path, kind, format, size, modifiedAt, width, height, duration, stage, attempt, maxAttempts, nextRetryAt, reason, updatedAt]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: '^[0-9a-f]{64}$'}
+        name: {type: string}
+        path: {type: string, description: Path relatif di MEDIA_ROOT.}
+        kind: {type: string, enum: [video, image]}
+        format: {type: string}
+        size: {type: integer, format: int64}
+        modifiedAt: {type: integer, format: int64, description: Detik Unix.}
+        width: {type: integer}
+        height: {type: integer}
+        duration: {type: number}
+        stage:
+          type: string
+          enum: [probe, sprite, conversion, queue, skipped]
+        attempt: {type: integer}
+        maxAttempts: {type: ['null', integer], description: Batas retry; null untuk stage probe (unlimited).}
+        nextRetryAt: {type: ['null', integer], format: int64, description: Detik Unix retry berikut; null bila tidak dijadwalkan.}
+        reason: {type: string, description: Pesan kegagalan atau note skip.}
+        strategy: {type: string, description: Strategi derivasi (remux/transcode_audio/transcode_full); hanya untuk stage conversion/queue.}
+        status: {type: string, enum: [pending, processing, waiting_source, ready, failed, unsupported], description: Status derivasi; hanya untuk conversion/queue.}
+        updatedAt: {type: ['null', integer], format: int64, description: Detik Unix update terakhir derivasi; null bila tidak ada.}
+        skippedBy: {type: string, description: Nama user yang skip; hanya untuk stage skipped.}
+    IssueCounts:
+      type: object
+      description: Counts global keenam kategori issue.
+      example: {probe: 2, sprite: 0, conversions: 3, queue: 5, skipped: 1, processing: 1}
+      required: [probe, sprite, conversions, queue, skipped, processing]
+      additionalProperties: false
+      properties:
+        probe: {type: integer}
+        sprite: {type: integer}
+        conversions: {type: integer}
+        queue: {type: integer}
+        skipped: {type: integer}
+        processing: {type: integer}
+    IssuePage:
+      type: object
+      description: Halaman hasil GET /api/admin/issues.
+      required: [tab, counts, total, items, limit, offset]
+      additionalProperties: false
+      properties:
+        tab: {type: string, enum: [failed, queue, skipped]}
+        counts: {$ref: '#/components/schemas/IssueCounts'}
+        total: {type: integer, description: Total item pada tab + filter (bukan jumlah halaman).}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/IssueItem'}
+        limit: {type: integer}
+        offset: {type: integer}

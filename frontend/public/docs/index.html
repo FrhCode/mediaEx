@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>mediaEx API — Swagger UI</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.20.1/swagger-ui.css" />
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <!--
+    Dev: file ini disajikan vite dev server tanpa openapi.yaml di /docs/.
+    Buka dengan ?url=http://localhost:8080/docs/openapi.yaml (atau arahkan
+    ke spec lain) bila server backend sedang jalan.
+  -->
+  <script src="https://unpkg.com/swagger-ui-dist@5.20.1/swagger-ui-bundle.js" crossorigin></script>
+  <script>
+    const params = new URLSearchParams(location.search)
+    window.onload = () => {
+      window.ui = SwaggerUIBundle({
+        url: params.get('url') || './openapi.yaml',
+        dom_id: '#swagger-ui',
+        deepLinking: true,
+        tryItCredentialsEnabled: true,
+      })
+    }
+  </script>
+</body>
+</html>

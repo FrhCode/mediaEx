@@ -31,3 +31,4 @@ ENTRYPOINT ["/app/mediaex"]
 
 FROM backend-runtime AS runtime
 COPY --from=frontend /build/frontend/dist /app/web
+COPY docs/openapi.yaml /app/web/docs/openapi.yaml

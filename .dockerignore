@@ -3,7 +3,8 @@
 .env
 .env.*
 !.env.example
-docs
+docs/*
+!docs/openapi.yaml
 **/node_modules
 **/dist
 **/test-results
