@@ -18,7 +18,7 @@
     const params = new URLSearchParams(location.search)
     window.onload = () => {
       window.ui = SwaggerUIBundle({
-        url: params.get('url') || './openapi.yaml',
+        url: params.get('url') || '/docs/openapi.yaml',
         dom_id: '#swagger-ui',
         deepLinking: true,
         tryItCredentialsEnabled: true,
